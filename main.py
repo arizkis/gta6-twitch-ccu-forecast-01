@@ -12,7 +12,7 @@ from pathlib import Path
 HOURS = range(2, 25)
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
-LAMBDA = 0.10
+LAMBDA = 0.20  # Unweighted share for hours 2-11; hours 12-24 use zero.
 SIZE_SCALE = 1.0
 SIGMA_FLOOR = 0.05
 SMOOTHING_WINDOW = 5
@@ -77,6 +77,14 @@ class ForecastResult:
     shape: dict[int, float]
     sigma: dict[int, float]  # Smoothed and floored, before applying k.
     k: float
+
+
+@dataclass(frozen=True)
+class SpreadCalibration:
+    sigma: dict[int, float]
+    log_size_threshold: float | None
+    large_k: float
+    rest_k: float
 
 
 def utc_time(value: str) -> datetime:
@@ -170,10 +178,22 @@ def similarity_log_weight(
     return weight
 
 
+def weighted_median(samples: list[tuple[float, float]]) -> float:
+    """Take the first ratio reaching half the total weight in ascending order."""
+    ordered = sorted(samples, key=lambda sample: sample[1])
+    midpoint = math.fsum(weight for weight, _ in ordered) / 2
+    cumulative = 0.0
+    for weight, ratio in ordered:
+        cumulative += weight
+        if cumulative >= midpoint:
+            return ratio
+    return ordered[-1][1]
+
+
 def blended_shape(
-    samples: list[tuple[float, float]], params: Params | None = None
+    samples: list[tuple[float, float]], hour: int, params: Params | None = None
 ) -> float:
-    """Partially pool weighted and unweighted means over identical samples."""
+    """Blend weighted and unweighted medians with hour-dependent shrinkage."""
     params = Params() if params is None else params
     if not samples:
         return 0.0  # No evidence for this hour: retain the hour-1 anchor.
@@ -183,10 +203,10 @@ def blended_shape(
     weighted = [
         (math.exp(log_weight - maximum), ratio) for log_weight, ratio in samples
     ]
-    total = math.fsum(weight for weight, _ in weighted)
-    weighted_mean = math.fsum(weight * ratio for weight, ratio in weighted) / total
-    unweighted_mean = math.fsum(ratio for _, ratio in samples) / len(samples)
-    return (1 - params.shrinkage) * weighted_mean + params.shrinkage * unweighted_mean
+    weighted_middle = weighted_median(weighted)
+    unweighted_middle = weighted_median([(1.0, ratio) for _, ratio in samples])
+    shrinkage = params.shrinkage if hour < 12 else 0.0
+    return (1 - shrinkage) * weighted_middle + shrinkage * unweighted_middle
 
 
 def compute_shape(
@@ -198,13 +218,13 @@ def compute_shape(
         weight = similarity_log_weight(target, curve, params)
         for hour, ratio in curve.ratios.items():
             samples[hour].append((weight, ratio))
-    return {hour: blended_shape(samples[hour], params) for hour in HOURS}
+    return {hour: blended_shape(samples[hour], hour, params) for hour in HOURS}
 
 
 def loo_residuals(
     curves: list[ComparableCurve], params: Params | None = None
-) -> dict[int, list[float]]:
-    """Predict each launch using only the other launches, with the same shrinkage."""
+) -> dict[int, list[tuple[float, float]]]:
+    """Pair each LOO residual with its launch's log hour-1 size."""
     params = Params() if params is None else params
     residuals = {hour: [] for hour in HOURS}
     for index, curve in enumerate(curves):
@@ -213,20 +233,33 @@ def loo_residuals(
         )
         shape = compute_shape(target, curves[:index] + curves[index + 1:], params)
         for hour, actual in curve.ratios.items():
-            residuals[hour].append(actual - shape[hour])
+            residuals[hour].append((actual - shape[hour], curve.log_first))
     return residuals
+
+
+def calibration_multiplier(standardized: list[float]) -> float:
+    """Nearest-rank 90th percentile, converted to a clamped normal multiplier."""
+    if not standardized:
+        return 1.0
+    ordered = sorted(standardized)
+    p90 = ordered[math.ceil(0.90 * len(ordered)) - 1]
+    return min(K_MAX, max(K_MIN, p90 / Z_SCORES[-1]))
 
 
 def calibrate_spread(
     curves: list[ComparableCurve], params: Params | None = None
-) -> tuple[dict[int, float], float]:
-    """Fit per-hour RMS spread and one pooled 90% coverage multiplier once."""
+) -> SpreadCalibration:
+    """Fit per-hour MAD spread and size-stratified 90% coverage multipliers."""
     residuals = loo_residuals(curves, params)
-    raw_sigma = {
-        hour: math.sqrt(math.fsum(value * value for value in values) / len(values))
-        if values else SIGMA_FLOOR
-        for hour, values in residuals.items()
-    }
+    raw_sigma = {}
+    for hour, samples in residuals.items():
+        values = sorted(value for value, _ in samples)
+        if values:
+            middle = values[len(values) // 2]
+            deviations = sorted(abs(value - middle) for value in values)
+            raw_sigma[hour] = 1.4826 * deviations[len(deviations) // 2]
+        else:
+            raw_sigma[hour] = SIGMA_FLOOR
     radius = SMOOTHING_WINDOW // 2
     sigma = {}
     for hour in HOURS:
@@ -237,15 +270,23 @@ def calibrate_spread(
             SIGMA_FLOOR, math.fsum(raw_sigma[neighbor] for neighbor in window) / len(window)
         )
 
-    standardized = sorted(
-        abs(value) / sigma[hour] for hour, values in residuals.items() for value in values
+    sizes = sorted(curve.log_first for curve in curves)
+    log_threshold = sizes[-math.ceil(len(sizes) / 3)] if sizes else None
+    standardized = []
+    large = []
+    rest = []
+    for hour, samples in residuals.items():
+        for value, log_first in samples:
+            scaled = abs(value) / sigma[hour]
+            standardized.append(scaled)
+            stratum = large if log_first >= log_threshold else rest
+            stratum.append(scaled)
+    pooled_k = calibration_multiplier(standardized)
+    return SpreadCalibration(
+        sigma, log_threshold,
+        calibration_multiplier(large) if large else pooled_k,
+        calibration_multiplier(rest) if rest else pooled_k,
     )
-    if not standardized:
-        return sigma, 1.0
-    # Nearest-rank empirical percentile: at least 90% are at or below p90.
-    p90 = standardized[math.ceil(0.90 * len(standardized)) - 1]
-    k = min(K_MAX, max(K_MIN, p90 / Z_SCORES[-1]))
-    return sigma, k
 
 
 def quantiles(log_median: float, sigma: float) -> list[float]:
@@ -266,7 +307,14 @@ def forecast_details(case: dict, params: Params | None = None) -> ForecastResult
     target = target_from_case(case)
     curves = extract_comparables(case.get("comparables", []))
     shape = compute_shape(target, curves, params)
-    sigma, k = calibrate_spread(curves, params)
+    calibration = calibrate_spread(curves, params)
+    sigma = calibration.sigma
+    k = (
+        calibration.large_k
+        if calibration.log_size_threshold is not None
+        and target.log_first >= calibration.log_size_threshold
+        else calibration.rest_k
+    )
     hours = [
         {"hour": hour, "q": quantiles(target.log_first + shape[hour], sigma[hour] * k)}
         for hour in HOURS
