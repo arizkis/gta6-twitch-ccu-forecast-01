@@ -12,13 +12,14 @@ from pathlib import Path
 HOURS = range(2, 25)
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
-LAMBDA = 0.25
+LAMBDA = 0.10
+SIZE_SCALE = 1.0
 SIGMA_FLOOR = 0.05
 SMOOTHING_WINDOW = 5
 K_MIN = 0.5
 K_MAX = 3.0
 LOG_MATCH_BONUS = math.log(2.0)
-RECENCY_YEARS = 6.0
+RECENCY_YEARS = 12.0
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 MIN_VIEWERS = 0.01  # Stays positive after rounding to two decimals.
 MAX_VIEWERS = 1_000_000_000.0
@@ -34,6 +35,22 @@ CONSOLE = re.compile(
     r"\b(?:consoles?|playstation\s*[1-5]?|ps[1-5]?|xbox|xb1|nintendo|switch|wii)\b",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class Params:
+    shrinkage: float = LAMBDA
+    size_scale: float = SIZE_SCALE
+    recency_years: float = RECENCY_YEARS
+
+    def __post_init__(self) -> None:
+        values = (self.shrinkage, self.size_scale, self.recency_years)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Forecast parameters must be finite")
+        if not 0 <= self.shrinkage <= 1:
+            raise ValueError("Shrinkage must lie in [0, 1]")
+        if self.size_scale <= 0 or self.recency_years <= 0:
+            raise ValueError("Size scale and recency years must be positive")
 
 
 @dataclass(frozen=True)
@@ -136,10 +153,16 @@ def target_from_case(case: dict) -> Target:
     )
 
 
-def similarity_log_weight(target: Target, curve: ComparableCurve) -> float:
+def similarity_log_weight(
+    target: Target, curve: ComparableCurve, params: Params | None = None
+) -> float:
     """Log of the product of size, unlock, console, and recency factors."""
+    params = Params() if params is None else params
     years = abs((curve.day_start - target.day_start).total_seconds()) / SECONDS_PER_YEAR
-    weight = -abs(curve.log_first - target.log_first) - years / RECENCY_YEARS
+    weight = (
+        -abs(curve.log_first - target.log_first) / params.size_scale
+        - years / params.recency_years
+    )
     if bool(ROLLING_UNLOCK.search(curve.unlock)) == target.rolling:
         weight += LOG_MATCH_BONUS
     if target.console and CONSOLE.search(curve.platforms):
@@ -147,8 +170,11 @@ def similarity_log_weight(target: Target, curve: ComparableCurve) -> float:
     return weight
 
 
-def blended_shape(samples: list[tuple[float, float]]) -> float:
+def blended_shape(
+    samples: list[tuple[float, float]], params: Params | None = None
+) -> float:
     """Partially pool weighted and unweighted means over identical samples."""
+    params = Params() if params is None else params
     if not samples:
         return 0.0  # No evidence for this hour: retain the hour-1 anchor.
 
@@ -160,34 +186,42 @@ def blended_shape(samples: list[tuple[float, float]]) -> float:
     total = math.fsum(weight for weight, _ in weighted)
     weighted_mean = math.fsum(weight * ratio for weight, ratio in weighted) / total
     unweighted_mean = math.fsum(ratio for _, ratio in samples) / len(samples)
-    return (1 - LAMBDA) * weighted_mean + LAMBDA * unweighted_mean
+    return (1 - params.shrinkage) * weighted_mean + params.shrinkage * unweighted_mean
 
 
-def compute_shape(target: Target, curves: list[ComparableCurve]) -> dict[int, float]:
+def compute_shape(
+    target: Target, curves: list[ComparableCurve], params: Params | None = None
+) -> dict[int, float]:
+    params = Params() if params is None else params
     samples = {hour: [] for hour in HOURS}
     for curve in curves:
-        weight = similarity_log_weight(target, curve)
+        weight = similarity_log_weight(target, curve, params)
         for hour, ratio in curve.ratios.items():
             samples[hour].append((weight, ratio))
-    return {hour: blended_shape(samples[hour]) for hour in HOURS}
+    return {hour: blended_shape(samples[hour], params) for hour in HOURS}
 
 
-def loo_residuals(curves: list[ComparableCurve]) -> dict[int, list[float]]:
+def loo_residuals(
+    curves: list[ComparableCurve], params: Params | None = None
+) -> dict[int, list[float]]:
     """Predict each launch using only the other launches, with the same shrinkage."""
+    params = Params() if params is None else params
     residuals = {hour: [] for hour in HOURS}
     for index, curve in enumerate(curves):
         target = target_attributes(
             curve.day_start, curve.log_first, comparable_notes(curve)
         )
-        shape = compute_shape(target, curves[:index] + curves[index + 1:])
+        shape = compute_shape(target, curves[:index] + curves[index + 1:], params)
         for hour, actual in curve.ratios.items():
             residuals[hour].append(actual - shape[hour])
     return residuals
 
 
-def calibrate_spread(curves: list[ComparableCurve]) -> tuple[dict[int, float], float]:
+def calibrate_spread(
+    curves: list[ComparableCurve], params: Params | None = None
+) -> tuple[dict[int, float], float]:
     """Fit per-hour RMS spread and one pooled 90% coverage multiplier once."""
-    residuals = loo_residuals(curves)
+    residuals = loo_residuals(curves, params)
     raw_sigma = {
         hour: math.sqrt(math.fsum(value * value for value in values) / len(values))
         if values else SIGMA_FLOOR
@@ -226,12 +260,13 @@ def quantiles(log_median: float, sigma: float) -> list[float]:
     return result
 
 
-def forecast_details(case: dict) -> ForecastResult:
+def forecast_details(case: dict, params: Params | None = None) -> ForecastResult:
     """Fit once, returning rows plus reusable shape and calibration diagnostics."""
+    params = Params() if params is None else params
     target = target_from_case(case)
     curves = extract_comparables(case.get("comparables", []))
-    shape = compute_shape(target, curves)
-    sigma, k = calibrate_spread(curves)
+    shape = compute_shape(target, curves, params)
+    sigma, k = calibrate_spread(curves, params)
     hours = [
         {"hour": hour, "q": quantiles(target.log_first + shape[hour], sigma[hour] * k)}
         for hour in HOURS
@@ -239,9 +274,9 @@ def forecast_details(case: dict) -> ForecastResult:
     return ForecastResult(hours, shape, sigma, k)
 
 
-def forecast(case: dict) -> list[dict]:
+def forecast(case: dict, params: Params | None = None) -> list[dict]:
     """Return the 23 forecast rows without performing any file I/O."""
-    return forecast_details(case).hours
+    return forecast_details(case, params).hours
 
 
 def main() -> None:
