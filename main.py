@@ -26,6 +26,57 @@ MAX_VIEWERS = 1_000_000_000.0
 LOG_MIN = math.log(MIN_VIEWERS)
 LOG_MAX = math.log(MAX_VIEWERS)
 
+ENSEMBLE_PRIOR_RATIO = {
+    2: 0.893,
+    3: 0.791,
+    4: 0.754,
+    5: 0.773,
+    6: 0.990,
+    7: 1.050,
+    8: 1.051,
+    9: 0.955,
+    10: 0.796,
+    11: 0.740,
+    12: 0.775,
+    13: 0.932,
+    14: 1.095,
+    15: 1.292,
+    16: 1.462,
+    17: 1.664,
+    18: 1.785,
+    19: 1.876,
+    20: 1.862,
+    21: 1.808,
+    22: 1.651,
+    23: 1.551,
+    24: 1.431,
+}
+SPREAD_FLOOR = {
+    2: 0.280,
+    3: 0.312,
+    4: 0.330,
+    5: 0.353,
+    6: 0.430,
+    7: 0.457,
+    8: 0.481,
+    9: 0.534,
+    10: 0.642,
+    11: 0.703,
+    12: 0.722,
+    13: 0.677,
+    14: 0.646,
+    15: 0.622,
+    16: 0.601,
+    17: 0.557,
+    18: 0.539,
+    19: 0.536,
+    20: 0.522,
+    21: 0.502,
+    22: 0.507,
+    23: 0.504,
+    24: 0.513,
+}
+
 ROLLING_UNLOCK = re.compile(
     r"\brolling\b|\bmidnight[\s-]+local\b|\blocal[\s-]+midnight\b"
     r"|\b12\s*a\.?m\.?\s+local\b",
@@ -309,16 +360,19 @@ def forecast_details(case: dict, params: Params | None = None) -> ForecastResult
     shape = compute_shape(target, curves, params)
     calibration = calibrate_spread(curves, params)
     sigma = calibration.sigma
-    k = (
-        calibration.large_k
-        if calibration.log_size_threshold is not None
+    top_stratum = (
+        calibration.log_size_threshold is not None
         and target.log_first >= calibration.log_size_threshold
-        else calibration.rest_k
     )
-    hours = [
-        {"hour": hour, "q": quantiles(target.log_first + shape[hour], sigma[hour] * k)}
-        for hour in HOURS
-    ]
+    k = calibration.large_k if top_stratum else calibration.rest_k
+    hours = []
+    for hour in HOURS:
+        log_ratio = shape[hour]
+        spread = sigma[hour] * k
+        if top_stratum:
+            log_ratio = (log_ratio + math.log(ENSEMBLE_PRIOR_RATIO[hour])) / 2
+            spread = max(spread, SPREAD_FLOOR[hour])
+        hours.append({"hour": hour, "q": quantiles(target.log_first + log_ratio, spread)})
     return ForecastResult(hours, shape, sigma, k)
 
 
